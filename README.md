@@ -1,1 +1,1 @@
-Mistral7B Paper [x]
+Mistral7B Paper  &#9745;
