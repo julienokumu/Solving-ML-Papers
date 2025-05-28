@@ -11,3 +11,5 @@ ViT: An Image is 16x16 words ✅
 Mixtral Of Experts ✅
 
 LLaMA2 ✅
+
+LLaMA ✅
