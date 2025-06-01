@@ -121,6 +121,6 @@ class DeepSeek7B(nn.Module):
             x = layer(x, mask)
         x = self.final_norm(x)
         logits = self.output(x)
-        print(f"Deepseek7B Logits: {logits.shape}")
         return logits
+    
 
