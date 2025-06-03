@@ -183,9 +183,9 @@ def generate_text(model, tokenizer, prompt, max_length=100, device="cpu"):
     return generated_text
 
 def train_model():
-    batch = 64
+    batch = 32
     context_length = 64
-    num_epochs = 20
+    num_epochs = 8
     learning_rate = 4.2e-4
     grad_accum_steps = 4
     text = download_tinyshakespeare()
