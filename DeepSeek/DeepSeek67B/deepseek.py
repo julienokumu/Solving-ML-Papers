@@ -50,7 +50,7 @@ class GQA(nn.Module):
     
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
         batch, seq_len, d_model = x.shape
-        q = self.q_proj(x).view(batch, seq_len, self.n_heads,self.head_dim).transpose(1, 2)
+        q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch, seq_len, self.n_kv_heads , self.head_dim).transpose(1, 2)
         q = self.rope(q)
