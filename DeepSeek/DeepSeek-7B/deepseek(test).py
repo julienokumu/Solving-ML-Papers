@@ -1,162 +1,183 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
 
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.gamma = nn.Parameter(torch.ones(hidden_dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden_dim = x.shape
-        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
-        normalized_x = x / rms
-        output = normalized_x * self.gamma
-        assert x.shape == output.shape, f"input shape and output shape must match"
-        print("\n===RMSNorm Test===")
-        print(f"input shape: {x.shape}, output shape: {output.shape}")
-        return output
-    
+# Updated Rotary Positional Embedding (RoPE)
 class RoPE(nn.Module):
     def __init__(self, head_dim: int, base: float = 10000):
         super().__init__()
+        # head_dim: dimension of each head (d_k)
         self.head_dim = head_dim
+        # base: base frequency for RoPE
         self.base = base
+        # Compute theta values: 1 / (base^(2i/head_dim))
         theta = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("theta", theta)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, n_heads, seq_len, head_dim = x.shape
-        assert head_dim == self.head_dim, "ensure head_dim matches"
-        positions = torch.arange(seq_len, device=x.device).unsqueeze(-1)
-        angles = positions * self.theta
-        cos = torch.cos(angles)
-        sin = torch.sin(angles)
-        cos = cos.unsqueeze(0).unsqueeze(1)
-        sin = sin.unsqueeze(0).unsqueeze(1)
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        rotated = torch.cat([-x2 * sin + x1 * cos, x1 * sin + x2 * cos], dim=-1)
-        assert x.shape == rotated.shape, "must match"
-        print("\n===RoPE Test===")
-        print(f"input shape: {x.shape}, output shape: {rotated.shape}")
+        # x: input tensor [batch_size, num_heads, seq_len, head_dim]
+        batch, num_heads, seq_len, head_dim = x.shape
+        # Compute position indices
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(-1)  # [seq_len, 1]
+        # Compute angles: position * theta
+        angles = positions * self.theta  # [seq_len, head_dim/2]
+        # Compute cos and sin for rotation
+        cos = torch.cos(angles)  # [seq_len, head_dim/2]
+        sin = torch.sin(angles)  # [seq_len, head_dim/2]
+        # Reshape for broadcasting
+        cos = cos.unsqueeze(0).unsqueeze(1)  # [1, 1, seq_len, head_dim/2]
+        sin = sin.unsqueeze(0).unsqueeze(1)  # [1, 1, seq_len, head_dim/2]
+        # Split input into even and odd dimensions
+        x1, x2 = x[..., ::2], x[..., 1::2]  # [batch_size, num_heads, seq_len, head_dim/2]
+        # Apply rotation: [x1 * cos - x2 * sin, x1 * sin + x2 * cos]
+        rotated = torch.cat([-x2 * sin + x1 * cos, x1 * sin + x2 * cos], dim=-1)  # [batch_size, num_heads, seq_len, head_dim]
         return rotated
-    
-class MHA(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        assert self.head_dim * n_heads == d_model, "d_model must be divisible by n_heads"
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.rope = RoPE(self.head_dim)
-    
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        batch, seq_len, d_model = x.shape
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        q = self.rope(q)
-        k = self.rope(k)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-        attn = F.softmax(scores, dim=-1)
-        output = torch.matmul(attn, v)
-        output = output.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
-        output = self.out_proj(output)
-        assert x.shape == output.shape, "input shape must be same as output shape"
-        print("\n===MHA Test===")
-        print(f"input shape: {x.shape}, output shape: {output.shape}")
-        return output
-    
-class SwiGLUFFN(nn.Module):
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.d_model = d_model
-        self.d_intermed = int((8/3 * d_model))
-        self.linear1 = nn.Linear(d_model, self.d_intermed)
-        self.linear2 = nn.Linear(d_model, self.d_intermed)
-        self.linear3 = nn.Linear(self.d_intermed, d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, d_model = x.shape
-        gate = F.silu(self.linear2(x))
-        x = self.linear1(x)
-        x = x * gate
-        output = self.linear3(x)
-        
-        print("\n===SwiGLUFFN Test===")
-        print(f"input shape: {x.shape}, output shape: {output.shape}")
+    def shape_check(self, x, output):
+        print(f"RoPE - Input shape: {x.shape}, Output shape: {output.shape}")
+
+# RMSNorm Layer
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        x_norm = x / rms * self.gamma
+        return x_norm
+
+    def shape_check(self, x, output):
+        print(f"RMSNorm - Input shape: {x.shape}, Output shape: {output.shape}")
+
+# SwiGLU Feed-Forward Network
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_int):
+        super().__init__()
+        self.d_model = d_model
+        self.d_int = d_int
+        self.w1 = nn.Linear(d_model, d_int, bias=True)
+        self.w2 = nn.Linear(d_model, d_int, bias=True)
+        self.w3 = nn.Linear(d_int, d_model, bias=True)
+        self.swish = lambda x: x * torch.sigmoid(x)
+
+    def forward(self, x):
+        gate = self.swish(self.w1(x))
+        x2 = self.w2(x)
+        hidden = gate * x2
+        output = self.w3(hidden)
         return output
-    
+
+    def shape_check(self, x, output):
+        print(f"SwiGLU - Input shape: {x.shape}, Output shape: {output.shape}")
+
+# Grouped-Query Attention (GQA) with Updated RoPE
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model, num_heads, num_kv_heads, head_dim):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.q_proj = nn.Linear(d_model, num_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(d_model, num_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(d_model, num_kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(num_heads * head_dim, d_model, bias=False)
+        # Use updated RoPE class
+        self.rotary = RoPE(head_dim)
+
+    def forward(self, x):
+        batch, seq_len, _ = x.shape
+        # Compute queries, keys, values
+        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim)  # [batch_size, seq_len, num_heads, head_dim]
+        k = self.k_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim)  # [batch_size, seq_len, num_kv_heads, head_dim]
+        v = self.v_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim)  # [batch_size, seq_len, num_kv_heads, head_dim]
+        # Transpose for RoPE: [batch_size, num_heads, seq_len, head_dim]
+        q = q.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+        k = k.transpose(1, 2)  # [batch_size, num_kv_heads, seq_len, head_dim]
+        # Apply RoPE to queries and keys
+        q = self.rotary(q)  # [batch_size, num_heads, seq_len, head_dim]
+        k = self.rotary(k)  # [batch_size, num_kv_heads, seq_len, head_dim]
+        # Transpose back: [batch_size, seq_len, num_heads, head_dim]
+        q = q.transpose(1, 2)  # [batch_size, seq_len, num_heads, head_dim]
+        k = k.transpose(1, 2)  # [batch_size, seq_len, num_kv_heads, head_dim]
+        # Repeat keys and values to match num_heads
+        k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2)  # [batch_size, seq_len, num_heads, head_dim]
+        v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2)  # [batch_size, seq_len, num_heads, head_dim]
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [batch_size, num_heads, seq_len, seq_len]
+        # Apply causal mask
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
+        scores = scores.masked_fill(mask == 0, float('-inf'))
+        # Softmax to get attention weights
+        attn = torch.softmax(scores, dim=-1)
+        # Compute attention output
+        context = torch.matmul(attn, v)  # [batch_size, seq_len, num_heads, head_dim]
+        # Reshape and project
+        context = context.reshape(batch, seq_len, -1)  # [batch_size, seq_len, num_heads * head_dim]
+        output = self.o_proj(context)  # [batch_size, seq_len, d_model]
+        return output
+
+    def shape_check(self, x, output):
+        print(f"GQA - Input shape: {x.shape}, Output shape: {output.shape}")
+
+# Transformer Block
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(self, d_model, num_heads, num_kv_heads, head_dim, d_int):
         super().__init__()
-        self.attn_norm = RMSNorm(d_model)
-        self.mha = MHA(d_model, n_heads)
-        self.ffn_norm = RMSNorm(d_model)
-        self.ffn = SwiGLUFFN(d_model)
-    
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        batch, seq_len, d_model = x.shape
-        x = self.attn_norm(x)
-        attn_output = self.mha(x, mask)
-        x = x + attn_output
-        x = self.ffn_norm(x)
-        ffn_output = self.ffn(x)
-        x = x + ffn_output
-        assert x.shape == x.shape, "shapes must match"
-        print("\n===TransformerBlock Test===")
-        print(f"input shape: {x.shape}, output shape: {x.shape}")
-        return x
+        self.norm1 = RMSNorm(d_model)
+        self.attn = GroupedQueryAttention(d_model, num_heads, num_kv_heads, head_dim)
+        self.norm2 = RMSNorm(d_model)
+        self.ffn = SwiGLU(d_model, d_int)
 
-class DeepSeek7B(nn.Module):
-    def __init__(self, d_model: int = 4096, n_heads: int = 32, n_layers: int = 32, context_length: int = 4096, vocab_size: int = 102400):
+    def forward(self, x):
+        x_norm = self.norm1(x)
+        attn_out = self.attn(x_norm)
+        x = x + attn_out
+        x_norm = self.norm2(x)
+        ffn_out = self.ffn(x_norm)
+        output = x + ffn_out
+        return output
+
+    def shape_check(self, x, output):
+        print(f"TransformerBlock - Input shape: {x.shape}, Output shape: {output.shape}")
+
+# DeepSeek LLM 67B Model
+class DeepSeekLLM(nn.Module):
+    def __init__(self, vocab_size=99, d_model=82, num_layers=9, num_heads=8, num_kv_heads=3):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.layers = nn.ModuleList([
-            TransformerBlock(
-                d_model,
-                n_heads
-            ) for _ in range(n_layers)
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = d_model // num_heads  # 128
+        self.d_int = int((8/9) * d_model)  # ~7282
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, num_kv_heads, self.head_dim, self.d_int)
+            for _ in range(num_layers)
         ])
-        self.final_norm = RMSNorm(d_model)
-        self.output = nn.Linear(d_model, vocab_size)
+        self.norm = RMSNorm(d_model)
+        self.out_proj = nn.Linear(d_model, vocab_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len = x.shape
-        x = self.embedding(x)
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device)).unsqueeze(0).unsqueeze(0)
-        for layer in self.layers:
-            x = layer(x, mask)
-        x = self.final_norm(x)
-        logits = self.output(x)
-        print(f"\n===DeepSeek7B Test===")
-        print(f"input shape: {x.shape}, output shape: {logits.shape}")
-        return logits
-    
-try:
-    print("starting model test....")
-    model = DeepSeek7B(d_model=128, n_heads=8, n_layers=2, vocab_size=1000)
-    print("model instantiated successfully")
-    x = torch.randint(0, 1000, (2, 16))
-    print(f"input shape: {x.shape}")
-    device = torch.device("cpu")
-    model = model.to(device)
-    x = x.to(device)
-    print(f"model and input moved to devie: {device}")
-    model.eval()
-    with torch.no_grad():
-        logits = model(x)
-    print(f"forward pass completed. Output shape: {logits.shape}")
-except Exception as e:
-    print(f"error occured: {str(e)}")
-    import traceback
-    traceback.print_exc()
+    def forward(self, x):
+        x = self.embed(x)  # [batch_size, seq_len, d_model]
+        for block in self.blocks:
+            x = block(x)  # [batch_size, seq_len, d_model]
+        x = self.norm(x)  # [batch_size, seq_len, d_model]
+        output = self.out_proj(x)  # [batch_size, seq_len, vocab_size]
+        return output
 
+    def shape_check(self, x, output):
+        print(f"DeepSeekLLM - Input shape: {x.shape}, Output shape: {output.shape}")
+
+# Test the model with a sample input
+batch, seq_len = 2, 100
+vocab_size = 70
+model = DeepSeekLLM()
+sample_input = torch.randint(0, vocab_size, (batch, seq_len))
+output = model(sample_input)
+model.shape_check(sample_input, output)
