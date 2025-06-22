@@ -13,3 +13,5 @@ Mixtral Of Experts ✅
 LLaMA2 ✅
 
 LLaMA ✅
+
+DeepSeekLLM ✅
