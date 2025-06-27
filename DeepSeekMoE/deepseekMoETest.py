@@ -1,21 +1,21 @@
-import torch 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import dataclasses as dataclass
+from dataclasses import dataclass
 import math
 
 @dataclass
 class ModelArgs:
-    vocab_size: int = 8000
-    hidden_dim: int = 1280
-    n_layers: int = 9
-    n_heads: int = 10
-    head_dim: int = 128
-    n_experts: int = 64
+    vocab_size: int = 160
+    hidden_dim: int = 320
+    n_layers: int = 2
+    n_heads: int = 5
+    head_dim: int = 64
+    n_experts: int = 32
     n_shared_experts: int = 1
-    n_activated_experts: int = 8
+    n_activated_experts: int = 4
     expert_scale: float = 0.25
-    ffn_intermed_scale: int = 4
+    ffn_intermed_scale: int = 2
 
 args = ModelArgs()
 
@@ -26,18 +26,20 @@ class ExpertFFN(nn.Module):
         self.gelu = nn.GELU()
         self.layer2 = nn.Linear(intermed_dim, hidden_dim)
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_dim = x.shape
         x = self.layer1(x)
-        x = self.gelu(x)
-        x = self.layer2(x)
-        return x
+        output = self.gelu(x)
+        output = self.layer2(x)
+        print("===ExpertFFN Test===")
+        print(f"input shape: {x.shape}, output shape: {output.shape}")
+        return output
 
 class MoE(nn.Module):
     def __init__(self, hidden_dim, n_experts, n_shared_experts, n_activated_experts, expert_scale):
         super().__init__()
         standard_intermed_dim = int(hidden_dim * args.ffn_intermed_scale)
-        expert_intermed_dim = int(standard_intermed_dim * expert_scale)
+        expert_intermed_dim = int(standard_intermed_dim * args.expert_scale)
         self.shared_experts = nn.ModuleList([
             ExpertFFN(
                 hidden_dim,
@@ -55,11 +57,11 @@ class MoE(nn.Module):
         self.n_activated_experts = n_activated_experts - n_shared_experts
         self.n_routed_experts = n_experts - n_shared_experts
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_dim = x.shape
         shared_output = torch.zeros_like(x)
         for expert in self.shared_experts:
-            shared_output = expert(x) + shared_output
+            shared_output += expert(x)
         logits = self.router(x)
         affinities = F.softmax(logits, dim=-1)
         topk_values, topk_indices = torch.topk(affinities, self.n_activated_experts, dim=-1)
@@ -69,22 +71,25 @@ class MoE(nn.Module):
             gate = gates[:, :, i].unsqueeze(-1)
             if gate.max() > 0:
                 expert_output = self.routed_experts[i](x)
-                routed_output = routed_output + gate * expert_output
+                routed_output += gate * expert_output
+        
         output = shared_output + routed_output + x
+        print("===MoE Test===")
+        print(f"input shape: {x.shape}, output shape: {output.shape}")
         return output
 
 class MHA(nn.Module):
     def __init__(self, hidden_dim, n_heads, head_dim):
         super().__init__()
-        self.n_heads = n_heads
         self.head_dim = head_dim
+        self.n_heads = n_heads
         self.q_proj = nn.Linear(hidden_dim, n_heads * head_dim)
         self.k_proj = nn.Linear(hidden_dim, n_heads * head_dim)
         self.v_proj = nn.Linear(hidden_dim, n_heads * head_dim)
         self.out_proj = nn.Linear(n_heads * head_dim, hidden_dim)
         self.scale = 1.0 / math.sqrt(head_dim)
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_dim = x.shape
         q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -93,22 +98,36 @@ class MHA(nn.Module):
         attn = F.softmax(scores, dim=-1)
         context = torch.matmul(attn, v).transpose(1, 2).contiguous().view(batch, seq_len, -1)
         output = self.out_proj(context)
+        print("===MHA Test===")
+        print(f"input shape: {x.shape}, output shape: {output.shape}")
         return output
 
 class TransformerBlock(nn.Module):
     def __init__(self, hidden_dim, n_heads, head_dim, n_experts, n_shared_experts, n_activated_experts, expert_scale):
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(hidden_dim)
-        self.mha = MHA(hidden_dim, n_heads, head_dim)
-        self.layer_norm2 = nn.Linear(hidden_dim)
-        self.moe = MoE(hidden_dim, n_experts, n_shared_experts, n_activated_experts, expert_scale)
+        self.mha = MHA(
+            hidden_dim,
+            n_heads,
+            head_dim
+        )
+        self.layer_norm2 = nn.LayerNorm(hidden_dim)
+        self.moe = MoE(
+            hidden_dim,
+            n_experts,
+            n_shared_experts,
+            n_activated_experts,
+            expert_scale
+        )
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_dim = x.shape
         x_norm = self.layer_norm1(x)
         attn_output = self.mha(x_norm) + x
         attn_norm = self.layer_norm2(attn_output)
         output = self.moe(attn_norm) + attn_output
+        print("===TransformerBlock Test===")
+        print(f"input shape: {x.shape}, output shape: {output.shape}")
         return output
 
 class DeepSeekMoE(nn.Module):
@@ -124,19 +143,27 @@ class DeepSeekMoE(nn.Module):
                 args.n_shared_experts,
                 args.n_activated_experts,
                 args.expert_scale
-            )
-            for _ in range(args.n_layers)
+            ) for _ in range(args.n_layers)
         ])
         self.layer_norm = nn.LayerNorm(args.hidden_dim)
         self.out_proj = nn.Linear(args.hidden_dim, args.vocab_size)
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len = x.shape
         x = self.emb(x)
         for layer in self.layers:
             x = layer(x)
         x = self.layer_norm(x)
         logits = self.out_proj(x)
+        print("===DeepSeekMoE Test===")
+        print(f"input shape: {x.shape}, output shape: {logits.shape}")
         return logits
 
 
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    batch, seq_len = 2, 16
+    x = torch.randint(0, args.vocab_size, (batch, seq_len))
+    model = DeepSeekMoE(args)
+    output = model(x)
+    
