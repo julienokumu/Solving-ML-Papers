@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from typing import Optional
 import math
 
 @dataclass
@@ -15,18 +16,54 @@ class ModelArgs:
     n_shared_experts: int = 1
     n_activated_experts: int = 4
     expert_scale: float = 0.25
-    ffn_intermed_scale: int = 2
+    ffn_inter_scale: int = 2
+    max_seq_len: int = 64
+    base: float = 10000.0
 
 args = ModelArgs()
 
-class ExpertFFN(nn.Module):
-    def __init__(self, hidden_dim, intermed_dim):
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_dim: int, eps: float = 1e-6):
         super().__init__()
-        self.layer1 = nn.Linear(hidden_dim, intermed_dim)
-        self.gelu = nn.GELU()
-        self.layer2 = nn.Linear(intermed_dim, hidden_dim)
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(hidden_dim))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, hidden_dim = x.shape
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        x_norm = x / rms * self.gamma
+        print("===RMSNorm Test===")
+        print(f"input shape: {x.shape}, output shape: {x_norm.shape}")
+        return x_norm
+
+class RoPE(nn.Module):
+    def __init__(self, head_dim: int, base: float):
+        super().__init__()
+        self.head_dim = head_dim
+        self.base = base
+        theta = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("theta", theta)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, n_heads, seq_len, head_dim = x.shape
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(-1)
+        angles = positions * self.theta
+        cos = torch.cos(angles).unsqueeze(0).unsqueeze(1)
+        sin = torch.sin(angles).unsqueeze(0).unsqueeze(1)
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        qk_rot = torch.cat([-x2 * sin + x1 * cos, x1 * sin + x2 * cos], dim=-1)
+        print("===RoPE Test===")
+        print(f"input shape: {x.shape}, output shape: {qk_rot.shape}")
+        return qk_rot
+
+class ExpertFFN(nn.Module):
+    def __init__(self, hidden_dim: int, inter_dim: int):
+        super().__init__()
+        self.layer1 = nn.Linear(hidden_dim, inter_dim)
+        self.gelu = nn.GELU()
+        self.layer2 = nn.Linear(inter_dim, hidden_dim)
+    
+    def forward(self, x: torch.Tensor):
         batch, seq_len, hidden_dim = x.shape
         x = self.layer1(x)
         output = self.gelu(x)
@@ -36,26 +73,29 @@ class ExpertFFN(nn.Module):
         return output
 
 class MoE(nn.Module):
-    def __init__(self, hidden_dim, n_experts, n_shared_experts, n_activated_experts, expert_scale):
+    def __init__(self, args):
         super().__init__()
-        standard_intermed_dim = int(hidden_dim * args.ffn_intermed_scale)
-        expert_intermed_dim = int(standard_intermed_dim * args.expert_scale)
+        standard_inter_dim = int(args.hidden_dim * args.ffn_inter_scale)
+        expert_inter_dim = int(standard_inter_dim * args.expert_scale)
         self.shared_experts = nn.ModuleList([
             ExpertFFN(
-                hidden_dim,
-                expert_intermed_dim
-            ) for _ in range(n_shared_experts)
+                args.hidden_dim,
+                expert_inter_dim
+            ) for _ in range(args.n_shared_experts)
         ])
         self.routed_experts = nn.ModuleList([
             ExpertFFN(
-                hidden_dim,
-                expert_intermed_dim
-            ) for _ in range(n_experts - n_shared_experts)
+                args.hidden_dim,
+                expert_inter_dim
+            ) for _ in range(args.n_experts - args.n_shared_experts)
         ])
-        self.router = nn.Linear(hidden_dim, n_experts - n_shared_experts)
-        self.n_shared_experts = n_shared_experts
-        self.n_activated_experts = n_activated_experts - n_shared_experts
-        self.n_routed_experts = n_experts - n_shared_experts
+        self.router = nn.Linear(
+            args.hidden_dim,
+            args.n_experts - args.n_shared_experts
+        )
+        self.n_shared_experts = args.n_shared_experts
+        self.n_activated_experts = args.n_activated_experts - args.n_shared_experts
+        self.n_routed_experts = args.n_experts - args.n_shared_experts
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_dim = x.shape
@@ -72,28 +112,30 @@ class MoE(nn.Module):
             if gate.max() > 0:
                 expert_output = self.routed_experts[i](x)
                 routed_output += gate * expert_output
-        
         output = shared_output + routed_output + x
         print("===MoE Test===")
         print(f"input shape: {x.shape}, output shape: {output.shape}")
         return output
 
 class MHA(nn.Module):
-    def __init__(self, hidden_dim, n_heads, head_dim):
+    def __init__(self, args):
         super().__init__()
-        self.head_dim = head_dim
-        self.n_heads = n_heads
-        self.q_proj = nn.Linear(hidden_dim, n_heads * head_dim)
-        self.k_proj = nn.Linear(hidden_dim, n_heads * head_dim)
-        self.v_proj = nn.Linear(hidden_dim, n_heads * head_dim)
-        self.out_proj = nn.Linear(n_heads * head_dim, hidden_dim)
-        self.scale = 1.0 / math.sqrt(head_dim)
+        self.q_proj = nn.Linear(args.hidden_dim, args.n_heads * args.head_dim)
+        self.k_proj = nn.Linear(args.hidden_dim, args.n_heads * args.head_dim)
+        self.v_proj = nn.Linear(args.hidden_dim, args.n_heads * args.head_dim)
+        self.out_proj = nn.Linear(args.n_heads * args.head_dim, args.hidden_dim)
+        self.rope = RoPE(args.head_dim, args.base)
+        self.n_heads = args.n_heads
+        self.head_dim = args.head_dim
+        self.scale = 1.0 / math.sqrt(args.head_dim)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, posiions: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_dim = x.shape
         q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        q = self.rope(q)
+        k = self.rope(k)
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = F.softmax(scores, dim=-1)
         context = torch.matmul(attn, v).transpose(1, 2).contiguous().view(batch, seq_len, -1)
@@ -103,27 +145,17 @@ class MHA(nn.Module):
         return output
 
 class TransformerBlock(nn.Module):
-    def __init__(self, hidden_dim, n_heads, head_dim, n_experts, n_shared_experts, n_activated_experts, expert_scale):
+    def __init__(self, args):
         super().__init__()
-        self.layer_norm1 = nn.LayerNorm(hidden_dim)
-        self.mha = MHA(
-            hidden_dim,
-            n_heads,
-            head_dim
-        )
-        self.layer_norm2 = nn.LayerNorm(hidden_dim)
-        self.moe = MoE(
-            hidden_dim,
-            n_experts,
-            n_shared_experts,
-            n_activated_experts,
-            expert_scale
-        )
+        self.layer_norm1 = RMSNorm(args.hidden_dim)
+        self.attn = MHA(args)
+        self.layer_norm2 = RMSNorm(args.hidden_dim)
+        self.moe = MoE(args)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, positions: torch.Tensor):
         batch, seq_len, hidden_dim = x.shape
         x_norm = self.layer_norm1(x)
-        attn_output = self.mha(x_norm) + x
+        attn_output = self.attn(x_norm, positions) + x
         attn_norm = self.layer_norm2(attn_output)
         output = self.moe(attn_norm) + attn_output
         print("===TransformerBlock Test===")
@@ -131,39 +163,33 @@ class TransformerBlock(nn.Module):
         return output
 
 class DeepSeekMoE(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args):
         super().__init__()
         self.emb = nn.Embedding(args.vocab_size, args.hidden_dim)
         self.layers = nn.ModuleList([
-            TransformerBlock(
-                args.hidden_dim,
-                args.n_heads,
-                args.head_dim,
-                args.n_experts,
-                args.n_shared_experts,
-                args.n_activated_experts,
-                args.expert_scale
-            ) for _ in range(args.n_layers)
+            TransformerBlock(args)
+            for _ in range(args.n_layers)
         ])
-        self.layer_norm = nn.LayerNorm(args.hidden_dim)
+        self.layer_norm = RMSNorm(args.hidden_dim)
         self.out_proj = nn.Linear(args.hidden_dim, args.vocab_size)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+    def forward(self, x: torch.Tensor, positions: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch, seq_len = x.shape
+        if positions is None:
+            seq_len = x.shape[1]
+            positions = torch.arange(seq_len, device=x.device)
         x = self.emb(x)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, positions)
         x = self.layer_norm(x)
         logits = self.out_proj(x)
         print("===DeepSeekMoE Test===")
         print(f"input shape: {x.shape}, output shape: {logits.shape}")
         return logits
 
-
-if __name__ == "__main__":
+if  __name__ == "__main__":
     torch.manual_seed(42)
     batch, seq_len = 2, 16
     x = torch.randint(0, args.vocab_size, (batch, seq_len))
     model = DeepSeekMoE(args)
     output = model(x)
-    
