@@ -4,9 +4,9 @@ import torch.nn.functional as F
 from transformers import GPT2Tokenizer
 import math
 
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float =0.1):
-        super(MultiHeadSelfAttention, self).__init__()
+class MHSA(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super(MHSA, self).__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
@@ -20,7 +20,6 @@ class MultiHeadSelfAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim)
         self.dropout = nn.Dropout(dropout)
 
-    
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         batch, seq_len, d_model = x.shape
 
@@ -41,7 +40,7 @@ class MultiHeadSelfAttention(nn.Module):
         return output
     
 class FFN(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, dropout: float =0.1):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super(FFN, self).__init__()
         self.linear1 = nn.Linear(d_model, d_ff)
         self.gelu = nn.GELU()
@@ -59,21 +58,24 @@ class FFN(nn.Module):
         return output
 
 class Block(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout=0.1):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
         super(Block, self).__init__()
-        self.attn = MultiHeadSelfAttention(
+        self.attn = MHSA(
             d_model,
             n_heads,
             dropout
         )
         self.norm1 = nn.LayerNorm(d_model)
+
         self.ffn = FFN(
             d_model,
             d_ff,
             dropout
         )
         self.norm2 = nn.LayerNorm(d_model)
+
         self.dropout = nn.Dropout(dropout)
+
     
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         batch, seq_len, d_model = x.shape
@@ -86,15 +88,14 @@ class Block(nn.Module):
 
         return x
     
-
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int = 510, n_layers: int = 6, n_heads: int = 6, d_ff: int = 1020, max_seq_len: int = 512, dropout: float = 0.1):
+    def __init__(self, vocab_size: int, d_model: int = 510, n_layers: int = 6, n_heads: int = 6, d_ff: int = 1020, context_length: int = 256, dropout: float = 0.1):
         super(GPT, self).__init__()
         self.d_model = d_model
-        self.max_seq_len = max_seq_len
+        self.context_length = context_length
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.pos_emb = nn.Embedding(context_length, d_model)
         self.dropout = nn.Dropout(dropout)
 
         self.layers = nn.ModuleList([
@@ -115,10 +116,10 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                
+
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-
+            
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
@@ -127,21 +128,21 @@ class GPT(nn.Module):
 
         if mask is not None:
             mask = torch.tril(torch.ones(seq_len, seq_len, device=input_ids.device)).unsqueeze(0).unsqueeze(0)
-
+        
         tok_emb = self.tok_emb(input_ids)
         positions = torch.arange(0, seq_len, device=input_ids.device).unsqueeze(0)
         pos_emb = self.pos_emb(positions)
 
-        x = self.dropout(pos_emb + tok_emb)
+        x = self.dropout(tok_emb + pos_emb)
 
         for layer in self.layers:
             x = layer(x, mask)
-
+        
         x = self.norm(x)
         logits = self.out_proj(x)
 
         return logits
-
+    
     @staticmethod
     def get_tokenizer():
         tokenizer = GPT2Tokenizer.from_pretrained("gpt2")

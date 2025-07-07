@@ -1,3 +1,5 @@
+
+
 import torch
 import torch.nn as nn
 from torch.optim import Adam
@@ -10,15 +12,20 @@ import math
 
 batch_size = 8
 context_length = 512
-num_epochs = 10
+num_epochs = 25
 learning_rate = 2.5e-4
 checkpoint_dir = "/kaggle/working/checkpoints"
-checkpoint_frequency = 60000
+checkpoint_frequency = 10000
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+subset_size = 1000
 
 def prepare_data(tokenizer, split="train"):
     dataset_path = f"/kaggle/input/tinystories-narrative-classification/{'train.csv' if split == 'train' else 'validation.csv'}"
     dataset = load_dataset("csv", data_files={split: dataset_path})[split]
+    if split == "train":
+        dataset = dataset.select(range(min(subset_size, len(dataset))))
+    elif split == "validate":
+        dataset = dataset.select(range(min(subset_size // 5, len(dataset))))
     def tokenize_function(examples):
         cleaned_texts = [str(text) if text is not None else "" for text in examples["text"]]
         return tokenizer(cleaned_texts, truncation=True, padding="max_length", max_length=context_length)
@@ -61,7 +68,7 @@ def load_latest_checkpoint(model, optimizer):
     print(f"Loaded checkpoint from {checkpoint_path}, resuming from epoch {epoch+1}, batch {batch_idx+1}")
     return epoch, batch_idx, loss
 
-def generate_text(model, tokenizer, prompt, max_length=100, device="cpu"):
+def generate_text(model, tokenizer, prompt, max_length=100, device=device, context_length=256):
     model.eval()
     input_ids = torch.tensor(tokenizer.encode(prompt), dtype=torch.long).unsqueeze(0).to(device)
     generated = input_ids
@@ -82,7 +89,7 @@ def train_model():
     tokenizer = GPT.get_tokenizer()
     tokenizer.pad_token = tokenizer.eos_token
     vocab_size = tokenizer.vocab_size
-    model = GPT(vocab_size=vocab_size, max_seq_len=context_length)
+    model = GPT(vocab_size=vocab_size, context_length=context_length)
     model.to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     optimizer = Adam(model.parameters(), lr=learning_rate)
@@ -101,7 +108,7 @@ def train_model():
             batch_count = 0
             optimizer.zero_grad()
 
-            for i, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}")):
+            for i, batch in enumerate (tqdm(train_dataloader, desc=f"Epoch {epoch+1}")):
                 if epoch == start_epoch and i <= start_batch:
                     continue
                 input_ids = batch["input_ids"].to(device)
@@ -149,11 +156,10 @@ def train_model():
         prompt = input("User: ")
         if prompt.lower() == "quit":
             break
-        generated_text = generate_text(model, tokenizer, prompt, max_length=300, device=device)
-        print(f"GPT-Stories: {generated_text}\n")
+        generated_text = generate_text(model, tokenizer, prompt, max_length=100, device=device, context_length=context_length)
+        print(f"TinyStoriesGPT64M: {generated_text}\n")
 
 if __name__ == "__main__":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    print("GPT-Stories is training...")
+    print("TinyStoriesGPT64M is training...")
     train_model()
-    
