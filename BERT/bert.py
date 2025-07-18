@@ -67,7 +67,7 @@ class MultiHeadAttention(nn.Module):
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_heads)
         attn_weights = torch.softmax(attn_scores, dim=-1)
         context = torch.matmul(attn_weights, V)
-        context = context.tranpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
         output = self.W_o(context)
         return output
     
@@ -95,7 +95,7 @@ class EncoderLayer(nn.Module):
     def forward(self, x):
         attn_output = self.attn(x)
         x = self.norm1(x + self.dropout(attn_output))
-        ffn_output = self.ff(x)
+        ffn_output = self.ffn(x)
         x = self.norm2(x + self.dropout(ffn_output))
         return x
     

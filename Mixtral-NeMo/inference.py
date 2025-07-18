@@ -20,13 +20,17 @@ class ModelArgs:
 
 args = ModelArgs()
 
+mask = jnp.tril(jnp.ones((1, 1, 128, 128), dtype=jnp.float16))
+theta = 1.0 / (args.base ** (jnp.arange(0, args.head_dim, 2, dtype=jnp.float16) / args.head_dim))
+
 class RMSNorm(nn.Module):
     dim: int
     eps: float
 
     def setup(self):
-        self.gamma = self.param('gamma', nn.initializers.ones, (self.dim,))
-    
+        self.gamma = self.param('gamma', lambda rng, shape: nn.initializers.ones(rng, shape, dtype=jnp.float16), (self.dim,))
+
+
     def __call__(self, x):
         rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
         return x / rms * self.gamma
@@ -36,10 +40,10 @@ class SwiGLUFFN(nn.Module):
     hidden_dim: int
 
     def setup(self):
-        self.linear1 = nn.Dense(self.hidden_dim)
-        self.gate = nn.Dense(self.hidden_dim)
-        self.linear2 = nn.Dense(self.dim)
-        self.beta = self.param('beta', nn.initializers.ones, (1,))
+        self.linear1 = nn.Dense(self.hidden_dim, dtype=jnp.float16)
+        self.gate = nn.Dense(self.hidden_dim, dtype=jnp.float16)
+        self.linear2 = nn.Dense(self.dim, dtype=jnp.float16)
+        self.beta = self.param('beta', lambda rng, shape: nn.initializers.ones(rng, shape, dtype=jnp.float16), (1,))
     
     def __call__(self, x):
         gate = nn.silu(self.gate(x))
@@ -48,20 +52,16 @@ class SwiGLUFFN(nn.Module):
 
 class RoPE(nn.Module):
     dim: int
-    base: float
 
-    def setup(self):
-        theta = 1.0 / (self.base ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
-        self.theta = theta
-    
-    def __call__(self, x, seq_len=None):
+    def __call__(self, x, seq_len=None, theta=theta):
         if seq_len is None:
             seq_len = x.shape[1]
         
-        positions = jnp.arange(seq_len, dtype=jnp.float32)
-        freqs = jnp.outer(positions, self.theta)
+        positions = jnp.arange(seq_len, dtype=jnp.float16)
+        freqs = jnp.outer(positions, theta).astype(jnp.float16)
+
         cos_emb = jnp.cos(freqs)[None, :, None, :]
-        sin_emb = jnp.sin(freqs)[None, :, None, :]
+        sin_emb = jnp.cos(freqs)[None, :, None, :]
         return cos_emb, sin_emb
 
 def apply_rotary_emb(x, cos_emb, sin_emb):
@@ -78,13 +78,13 @@ class MHA(nn.Module):
     head_dim: int
 
     def setup(self):
-        self.q_proj = nn.Dense(self.n_heads * self.head_dim, use_bias=False)
-        self.k_proj = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False)
-        self.v_proj = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False)
-        self.out_proj = nn.Dense(self.dim, use_bias=False)
-        self.rotary_emb = RoPE(self.head_dim, args.base)
+        self.q_proj = nn.Dense(self.n_heads * self.head_dim, use_bias=False, dtype=jnp.float16)
+        self.k_proj = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False, dtype=jnp.float16)
+        self.v_proj = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False, dtype=jnp.float16)
+        self.out_proj = nn.Dense(self.dim, use_bias=False, dtype=jnp.float16)
+        self.rotary_emb = RoPE(self.head_dim)
         self.scale = self.head_dim ** -0.5
-
+    
     def __call__(self, x, mask=None):
         batch, seq_len, _ = x.shape
 
@@ -105,8 +105,8 @@ class MHA(nn.Module):
         scores = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * self.scale
         if mask is not None:
             scores = jnp.where(mask == 0, float('-inf'), scores)
-        
         attn = nn.softmax(scores, axis=-1)
+
         output = jnp.matmul(attn, v).transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
         return self.out_proj(output)
 
@@ -119,24 +119,15 @@ class Block(nn.Module):
 
     def setup(self):
         self.attn = MHA(
-            self.dim,
-            self.n_heads,
-            self.n_kv_heads,
+            self.dim, 
+            self.n_heads, 
+            self.n_kv_heads, 
             self.head_dim
         )
-        self.laynorm1 = RMSNorm(
-            self.dim,
-            args.eps
-        )
+        self.laynorm1 = RMSNorm(self.dim, args.eps)
 
-        self.ffn = SwiGLUFFN(
-            self.dim,
-            self.hidden_dim
-        )
-        self.laynorm2 = RMSNorm(
-            self.dim,
-            args.eps
-        )
+        self.ffn = SwiGLUFFN(self.dim, self.hidden_dim)
+        self.laynorm2 = RMSNorm(self.dim, args.eps)
     
     def __call__(self, x, mask=None):
         x_norm = self.laynorm1(x)
@@ -154,32 +145,25 @@ class MixtralNeMo(nn.Module):
     n_layers: int
 
     def setup(self):
-        self.emb = nn.Embed(self.vocab_size, self.dim)
-        self.layers = [
-            Block(
-                self.dim,
-                self.n_heads,
-                self.n_kv_heads,
-                self.head_dim,
-                self.hidden_dim
-            ) for _ in range(self.n_layers)
-        ]
+        self.emb = nn.Embed(self.vocab_size, self.dim, dtype=jnp.float16)
+        self.layers = [Block(
+            self.dim,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+            self.hidden_dim
+        )]
         self.norm = RMSNorm(self.dim, args.eps)
-        self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
+        self.lm_head = nn.Dense(self.vocab_size, use_bias=False, dtype=jnp.float16)
     
     def __call__(self, input_ids, mask=None):
         batch, seq_len = input_ids.shape
-    
-        x = self.emb(input_ids)
 
-        if mask is None:
-            mask = jnp.tril(jnp.ones((1, 1, seq_len, seq_len)))
-        
+        x = self.emb(input_ids).astype(jnp.float16)
         for layer in self.layers:
             x = layer(x, mask)
-        
         x = self.norm(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x).astype(jnp.float32)
         return logits
 
 def inference():
@@ -193,28 +177,23 @@ def inference():
         n_kv_heads=args.n_kv_heads,
         n_layers=args.n_layers
     )
-
     input_ids = jnp.ones((1, 128), dtype=jnp.int32)
     params = model.init(key, input_ids)
 
     @jax.jit
-    def forward(params, input_ids, mask=None):
+    def forward(params, input_ids, mask=mask):
         return model.apply(params, input_ids, mask)
-    
+
     _ = forward(params, input_ids)
-
-    jax.profiler.start_trace("./jax=trace")
+    runs = 100
+    jax.profiler.start_trace("./jax-trace")
     start_time = time.time()
-
-    logits = forward(params, input_ids)
-
-    logits.block_until_ready()
+    for _ in range(runs):
+        logits = forward(params, input_ids)
+        logits.block_until_ready()
     end_time = time.time()
     jax.profiler.stop_trace()
-
-    print(f"inference time: {(end_time - start_time) * 1000:.2f} ms")
-    print("profile data saved to ./jax-trace. view using tensorboard")
+    print(f"average inference time: {((end_time - start_time) * 1000) / runs:.2f} ms")
 
 if __name__ == "__main__":
     inference()
-    
